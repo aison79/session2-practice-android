@@ -10,7 +10,7 @@ android {
         applicationId 'com.aison79.session2'
         minSdk 23
         targetSdk 35
-        versionCode 1
-        versionName '1.0'
+        versionCode((System.getenv('APK_VERSION_CODE') ?: '1').toInteger())
+        versionName(System.getenv('APK_VERSION_NAME') ?: '1.0')
     }
 }

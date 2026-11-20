@@ -1,0 +1,92 @@
+name: Publish Signed Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Set APK version
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Use a version tag such as v1.0.0."
+            exit 1
+          fi
+          echo "APK_VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "APK_VERSION_CODE=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Sign and verify the APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" || -z "$ANDROID_KEYSTORE_PASSWORD" ]]; then
+            echo "::error::Set ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD in the repository Actions secrets."
+            exit 1
+          fi
+
+          umask 077
+          keystore="$RUNNER_TEMP/session2-release.p12"
+          aligned_apk="$RUNNER_TEMP/app-release-aligned.apk"
+          trap 'rm -f -- "$keystore" "$aligned_apk"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          unsigned_apk="app/build/outputs/apk/release/app-release-unsigned.apk"
+          "$tools/zipalign" -f 4 "$unsigned_apk" "$aligned_apk"
+          "$tools/apksigner" sign \
+            --ks "$keystore" --ks-type PKCS12 --ks-key-alias session2-release \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --out app-release.apk "$aligned_apk"
+          "$tools/apksigner" verify --verbose app-release.apk
+
+      - name: Upload the signed APK as an artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-release-apk
+          path: app-release.apk
+          if-no-files-found: error
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if ! gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq app-release.apk; then
+              gh release upload "$GITHUB_REF_NAME" app-release.apk
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" app-release.apk \
+              --verify-tag --title "Android APK $GITHUB_REF_NAME" \
+              --notes "Signed APK built and verified by GitHub Actions."
+          fi
